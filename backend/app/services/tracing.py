@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -42,16 +43,32 @@ class LangfuseExporter:
         if not self.enabled:
             yield None
             return
+
         try:
             from langfuse import get_client
 
-            client = get_client()
-            with client.start_as_current_observation(
+            observation_context = get_client().start_as_current_observation(
                 as_type="agent",
                 name=name,
                 input=input_payload,
-            ) as observation:
-                yield observation
+            )
+            observation = observation_context.__enter__()
         except Exception:
-            # Observability should never make the investigation endpoint unavailable.
             yield None
+            return
+
+        try:
+            yield observation
+        except BaseException:
+            # Keep the business exception as the source of truth even if exporter cleanup fails.
+            exc_info = sys.exc_info()
+            try:
+                observation_context.__exit__(*exc_info)
+            except Exception:
+                pass
+            raise
+        else:
+            try:
+                observation_context.__exit__(None, None, None)
+            except Exception:
+                pass
