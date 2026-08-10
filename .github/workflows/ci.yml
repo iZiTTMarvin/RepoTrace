@@ -22,8 +22,10 @@ jobs:
         run: ruff check .
       - name: Tests
         run: pytest --cov=app --cov-report=term-missing
-      - name: Benchmark
+      - name: Demo benchmark
         run: python -m scripts.run_benchmark
+      - name: Real GitHub benchmark
+        run: python -m scripts.run_github_benchmark --scope repo
 
   frontend:
     runs-on: ubuntu-latest
