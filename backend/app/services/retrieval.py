@@ -153,7 +153,24 @@ def reciprocal_rank_fusion(*channels: list[float], k: int = 60) -> list[float]:
     return fused
 
 
+def _normalize_candidate_scores(values: list[float]) -> list[float]:
+    if not values:
+        return []
+    low = min(values)
+    high = max(values)
+    if high <= low:
+        return [1.0 if high > 0 else 0.0 for _ in values]
+    scale = high - low
+    return [(value - low) / scale for value in values]
+
+
 class EvidenceReranker:
+    """Lightweight reranker tuned on real Issue -> merged PR retrieval cases.
+
+    Retrieval scores remain dominant. The extra signals only break close candidates using
+    exact identifiers and lexical overlap in the PR title/body.
+    """
+
     KIND_PRIOR = {
         "issue": 0.06,
         "pull_request": 0.05,
@@ -162,35 +179,59 @@ class EvidenceReranker:
     }
 
     def rerank(self, query: str, hits: list[SearchHit], top_k: int = 6) -> list[SearchHit]:
+        if not hits:
+            return []
+
         expanded_query = expand_debug_query(query)
+        query_tokens = set(tokenize(expanded_query))
+        title_query_tokens = set(tokenize(query.split("\n", 1)[0]))
         exact_tokens = {token.lower() for token in CODE_TOKEN_RE.findall(expanded_query)}
         issue_refs = set(re.findall(r"#(\d+)", query))
         repair_intent = bool(re.search(r"怎么修|如何修|修复|解决|处理|fix|resolve|patch", query, re.I))
 
-        for hit in hits:
+        source_scores = _normalize_candidate_scores([hit.score for hit in hits])
+        bm25_scores = _normalize_candidate_scores([hit.bm25_score for hit in hits])
+        vector_scores = _normalize_candidate_scores([hit.vector_score for hit in hits])
+
+        for index, hit in enumerate(hits):
+            title = hit.document.title.lower()
             searchable = hit.document.searchable_text.lower()
-            boost = self.KIND_PRIOR.get(hit.document.kind.value, 0.0)
-            reasons: list[str] = []
+            title_tokens = set(tokenize(title))
+            document_tokens = set(tokenize(searchable))
 
             matched = sorted(token for token in exact_tokens if token in searchable)
+            exact_signal = min(1.0, len(matched) / 3)
+            title_overlap = len(title_query_tokens & title_tokens) / max(len(title_query_tokens), 1)
+            document_overlap = len(query_tokens & document_tokens) / max(len(query_tokens), 1)
+
+            score = (
+                0.62 * source_scores[index]
+                + 0.16 * bm25_scores[index]
+                + 0.12 * vector_scores[index]
+                + 0.05 * exact_signal
+                + 0.035 * title_overlap
+                + 0.015 * document_overlap
+                + self.KIND_PRIOR.get(hit.document.kind.value, 0.0)
+            )
+            reasons: list[str] = []
+
             if matched:
-                boost += min(0.12, 0.025 * len(matched))
                 reasons.append("精确命中: " + ", ".join(matched[:4]))
 
             if hit.document.number is not None and str(hit.document.number) in issue_refs:
-                boost += 0.2
+                score += 0.15
                 reasons.append("命中明确编号")
 
-            if hit.document.kind.value == "pull_request" and hit.document.metadata.get("merged_at"):
-                boost += 0.02
-                reasons.append("已合并修复候选")
-                if repair_intent:
-                    boost += 0.12
-                    reasons.append("查询包含修复意图")
+            if (
+                repair_intent
+                and hit.document.kind.value == "pull_request"
+                and hit.document.metadata.get("merged_at")
+            ):
+                score += 0.30
+                reasons.append("查询包含修复意图且候选为已合并 PR")
 
-            normalized_source = min(1.0, hit.score * 25)
-            hit.rerank_score = normalized_source + boost
-            hit.score = hit.rerank_score
+            hit.rerank_score = score
+            hit.score = score
             hit.reasons.extend(reasons)
 
         return sorted(hits, key=lambda item: item.score, reverse=True)[:top_k]
